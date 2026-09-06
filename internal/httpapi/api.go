@@ -25,6 +25,13 @@ type ClickReader interface {
 	ClickCount(ctx context.Context, code string) (int64, error)
 }
 
+// LinkCreator turns a destination into a stored link. Behind an interface so
+// the handler does not know whether IDs come from a sequence or a block
+// allocator, nor how the code is derived from one.
+type LinkCreator interface {
+	Create(ctx context.Context, destination string) (store.Link, error)
+}
+
 // LinkResolver resolves a code to its destination. The handler does not know
 // whether that answer came from an in-process cache, Redis or Postgres --
 // which is what lets the cache tiers be added, reordered or disabled without
@@ -40,6 +47,7 @@ const maxDestinationLen = 2048
 // API holds the handler dependencies.
 type API struct {
 	store    *store.Store
+	creator  LinkCreator
 	resolver LinkResolver
 	clicks   ClickReader
 	recorder analytics.Recorder
@@ -49,9 +57,10 @@ type API struct {
 }
 
 // New builds an API. baseURL prefixes codes in creation responses.
-func New(s *store.Store, res LinkResolver, clicks ClickReader, recorder analytics.Recorder, m *metrics.Metrics, logger *slog.Logger, baseURL string) *API {
+func New(s *store.Store, creator LinkCreator, res LinkResolver, clicks ClickReader, recorder analytics.Recorder, m *metrics.Metrics, logger *slog.Logger, baseURL string) *API {
 	return &API{
 		store:    s,
+		creator:  creator,
 		resolver: res,
 		clicks:   clicks,
 		recorder: recorder,
@@ -103,7 +112,7 @@ func (a *API) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	link, err := a.store.CreateLink(r.Context(), destination, shortcode.Encode)
+	link, err := a.creator.Create(r.Context(), destination)
 	if err != nil {
 		a.logger.Error("create link", "err", err)
 		writeError(w, http.StatusInternalServerError, "could not create link")

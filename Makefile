@@ -8,6 +8,9 @@ ZIPF_S ?= 1.2
 ANALYTICS_MODE ?= batch
 ANALYTICS_SINK ?= postgres
 STAMPEDE_N ?= 10000
+REPLICAS ?= 3
+CREATE_N ?= 20000
+CREATE_CONCURRENCY ?= 100
 TEST_DATABASE_URL ?= postgres://linkflow:linkflow@localhost:5433/linkflow_test?sslmode=disable
 
 .PHONY: help
@@ -50,6 +53,19 @@ check: fmt vet test ## Format, vet and test
 up: ## Start the stack (ANALYTICS_MODE=batch|sync, ANALYTICS_SINK=postgres|clickhouse)
 	LINKFLOW_ANALYTICS_MODE=$(ANALYTICS_MODE) LINKFLOW_ANALYTICS_SINK=$(ANALYTICS_SINK) \
 		docker compose up --build -d
+
+.PHONY: cluster
+cluster: ## Start REPLICAS instances behind nginx (phase 5)
+	docker compose -f docker-compose.yml -f docker-compose.cluster.yml \
+		up --build -d --scale linkflow=$(REPLICAS)
+
+.PHONY: cluster-down
+cluster-down: ## Stop the clustered stack
+	docker compose -f docker-compose.yml -f docker-compose.cluster.yml down
+
+.PHONY: allocator-check
+allocator-check: ## Create CREATE_N links concurrently and verify every code is unique
+	go run ./bench/allocator -base-url $(BASE_URL) -concurrent $(CREATE_CONCURRENCY) -count $(CREATE_N)
 
 .PHONY: down
 down: ## Stop the stack, keeping the Postgres volume

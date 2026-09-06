@@ -70,6 +70,14 @@ type Config struct {
 	ClickHouseDatabase string
 	ClickHouseUser     string
 	ClickHousePassword string
+
+	// IDBlockSize is how many link IDs an instance claims per database write.
+	// Larger means fewer writes and more IDs abandoned on restart.
+	IDBlockSize int
+	// CodeSeed keys the Feistel permutation. Every instance must use the same
+	// value, and changing it after launch makes every existing short code
+	// decode to a different link.
+	CodeSeed uint64
 }
 
 // Analytics recorder modes.
@@ -148,6 +156,15 @@ func Load() (Config, error) {
 	cfg.ClickHouseDatabase = env("LINKFLOW_CLICKHOUSE_DATABASE", "linkflow")
 	cfg.ClickHouseUser = env("LINKFLOW_CLICKHOUSE_USER", "linkflow")
 	cfg.ClickHousePassword = env("LINKFLOW_CLICKHOUSE_PASSWORD", "linkflow")
+
+	if cfg.IDBlockSize, err = envInt("LINKFLOW_ID_BLOCK_SIZE", 10000); err != nil {
+		return Config{}, err
+	}
+	seed, err := envInt("LINKFLOW_CODE_SEED", 0x5EED1E)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeSeed = uint64(seed)
 
 	return cfg, nil
 }

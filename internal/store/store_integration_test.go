@@ -8,13 +8,23 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/Talin12/URL-Shortner/internal/shortcode"
 )
+
+// insert stores a link using the codec, mirroring what the creator does.
+func insert(t *testing.T, s *Store, id uint64, destination string) Link {
+	t.Helper()
+	codec := shortcode.NewCodec(1)
+	link, err := s.InsertLink(context.Background(), id, codec.Encode(id), destination)
+	if err != nil {
+		t.Fatalf("InsertLink: %v", err)
+	}
+	return link
+}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -42,12 +52,9 @@ func TestCreateAndResolve(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	link, err := s.CreateLink(ctx, "https://example.com/one", shortcode.Encode)
-	if err != nil {
-		t.Fatalf("CreateLink: %v", err)
-	}
+	link := insert(t, s, 4242, "https://example.com/one")
 	if link.Code == "" {
-		t.Fatal("CreateLink returned an empty code")
+		t.Fatal("InsertLink returned an empty code")
 	}
 
 	got, err := s.Destination(ctx, link.Code)
@@ -68,39 +75,54 @@ func TestDestinationMissingCode(t *testing.T) {
 	}
 }
 
-func TestCodesAreUniqueAcrossConcurrentCreates(t *testing.T) {
-	// The sequence is the coordination point phase 1 accepts and the block
-	// allocator later removes. This test is what proves the replacement still
-	// holds the same invariant.
+// Concurrent block claims must never overlap. The row lock the UPDATE takes is
+// the only thing standing between two instances and duplicate short codes, so
+// this exercises it against a real Postgres rather than a fake counter.
+func TestConcurrentBlockClaimsNeverOverlap(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	const n = 200
-	codes := make(chan string, n)
-	errs := make(chan error, n)
+	const claims, size = 50, 1000
+	starts := make(chan uint64, claims)
+	errs := make(chan error, claims)
 
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			link, err := s.CreateLink(ctx, fmt.Sprintf("https://example.com/%d", i), shortcode.Encode)
+	for i := 0; i < claims; i++ {
+		go func() {
+			start, err := s.ClaimIDBlock(ctx, "links", size)
 			if err != nil {
 				errs <- err
 				return
 			}
-			codes <- link.Code
-		}(i)
+			starts <- start
+		}()
 	}
 
-	seen := make(map[string]bool, n)
-	for i := 0; i < n; i++ {
+	seen := make(map[uint64]bool, claims)
+	for i := 0; i < claims; i++ {
 		select {
 		case err := <-errs:
-			t.Fatalf("concurrent CreateLink: %v", err)
-		case code := <-codes:
-			if seen[code] {
-				t.Fatalf("duplicate code issued: %q", code)
+			t.Fatalf("concurrent ClaimIDBlock: %v", err)
+		case start := <-starts:
+			if seen[start] {
+				t.Fatalf("block starting at %d was handed out twice", start)
 			}
-			seen[code] = true
+			seen[start] = true
 		}
+	}
+
+	// Every block must be a clean multiple of the size apart, or ranges
+	// overlap somewhere.
+	for start := range seen {
+		if start%size != 0 {
+			t.Errorf("block start %d is not aligned to the block size; ranges overlap", start)
+		}
+	}
+}
+
+func TestClaimUnknownBlockFails(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.ClaimIDBlock(context.Background(), "not-a-block", 10); err == nil {
+		t.Error("ClaimIDBlock succeeded for a name that does not exist")
 	}
 }
 
@@ -108,10 +130,7 @@ func TestClickInsertAndCount(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	link, err := s.CreateLink(ctx, "https://example.com/clicks", shortcode.Encode)
-	if err != nil {
-		t.Fatalf("CreateLink: %v", err)
-	}
+	link := insert(t, s, 5252, "https://example.com/clicks")
 
 	if err := s.InsertClick(ctx, ClickEvent{Code: link.Code, OccurredAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("InsertClick: %v", err)

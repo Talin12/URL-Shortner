@@ -1,0 +1,27 @@
+# Phase 5 overlay: three service instances behind nginx.
+#
+# Use with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.cluster.yml up -d --scale linkflow=3
+# or just `make cluster`.
+#
+# The base file's single-instance setup stays intact for development; this
+# overlay only removes the host port binding (replicas cannot all claim 8080)
+# and puts nginx there instead.
+
+services:
+  linkflow:
+    ports: !reset []
+    environment:
+      # Every replica must derive the same codec keys, or a code issued by one
+      # would decode to a different link on another.
+      LINKFLOW_CODE_SEED: "${LINKFLOW_CODE_SEED:-6222366}"
+      LINKFLOW_ID_BLOCK_SIZE: "${LINKFLOW_ID_BLOCK_SIZE:-10000}"
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${LINKFLOW_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - linkflow

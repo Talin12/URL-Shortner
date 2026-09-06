@@ -61,16 +61,30 @@ func (s *Store) Close() { s.pool.Close() }
 // Ping reports whether Postgres is reachable, for the readiness endpoint.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-// CreateLink allocates an ID from the sequence, encodes it with the supplied
-// function, and inserts the row. The encode callback keeps base62 (and later
-// the Feistel bijection) out of the storage layer.
-func (s *Store) CreateLink(ctx context.Context, destination string, encode func(uint64) string) (Link, error) {
-	var id uint64
-	if err := s.pool.QueryRow(ctx, `SELECT nextval('link_id_seq')`).Scan(&id); err != nil {
-		return Link{}, fmt.Errorf("store: allocate id: %w", err)
+// ClaimIDBlock reserves size IDs and returns the first one.
+//
+// The UPDATE takes a row lock for its duration, so concurrent claims -- from
+// goroutines or from separate instances -- serialise and each receives a
+// disjoint range. That single row is the only coordination point in link
+// creation, and it is touched once per block rather than once per link.
+func (s *Store) ClaimIDBlock(ctx context.Context, name string, size uint64) (uint64, error) {
+	var start uint64
+	err := s.pool.QueryRow(ctx,
+		`UPDATE id_blocks SET next_id = next_id + $1 WHERE name = $2 RETURNING next_id - $1`,
+		size, name,
+	).Scan(&start)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("store: no id block named %q", name)
+		}
+		return 0, fmt.Errorf("store: claim id block: %w", err)
 	}
+	return start, nil
+}
 
-	link := Link{ID: id, Code: encode(id), Destination: destination}
+// InsertLink stores a link whose ID and code the caller already decided.
+func (s *Store) InsertLink(ctx context.Context, id uint64, code, destination string) (Link, error) {
+	link := Link{ID: id, Code: code, Destination: destination}
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO links (id, code, destination) VALUES ($1, $2, $3) RETURNING created_at`,
 		link.ID, link.Code, link.Destination,

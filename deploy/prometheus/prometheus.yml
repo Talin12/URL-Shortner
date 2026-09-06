@@ -6,5 +6,11 @@ global:
 
 scrape_configs:
   - job_name: linkflow
-    static_configs:
-      - targets: ["linkflow:8080"]
+    # DNS service discovery rather than a static target: Docker returns one A
+    # record per replica, so scaling the service up automatically adds targets
+    # instead of silently leaving instances unmonitored.
+    dns_sd_configs:
+      - names: ["linkflow"]
+        type: A
+        port: 8080
+        refresh_interval: 5s

@@ -12,10 +12,23 @@ CREATE TABLE IF NOT EXISTS links (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Codes are handed out from this sequence in phase 1. One round trip per
--- creation and fully enumerable output; both are replaced by the block
--- allocator plus Feistel bijection later (PLAN.md 5.4).
+-- Phase 1 handed out IDs from this sequence: one round trip per creation, and
+-- fully enumerable output. Kept only so existing databases still migrate; the
+-- block allocator below replaced it (PLAN.md 5.4).
 CREATE SEQUENCE IF NOT EXISTS link_id_seq AS BIGINT START WITH 100000 OWNED BY links.id;
+
+-- The block allocator's counter. One row, one UPDATE per 10,000 links, and no
+-- coordination at all in between. The UPDATE takes a row lock, which is what
+-- guarantees two instances never receive overlapping blocks.
+CREATE TABLE IF NOT EXISTS id_blocks (
+    name    TEXT   PRIMARY KEY,
+    next_id BIGINT NOT NULL
+);
+
+-- Start above the phase 1 sequence so old and new IDs cannot collide in a
+-- database that has both.
+INSERT INTO id_blocks (name, next_id) VALUES ('links', 1000000)
+    ON CONFLICT (name) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS click_events (
     id          BIGSERIAL   PRIMARY KEY,

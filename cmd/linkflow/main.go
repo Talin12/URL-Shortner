@@ -15,8 +15,11 @@ import (
 	"github.com/Talin12/URL-Shortner/internal/clickstore"
 	"github.com/Talin12/URL-Shortner/internal/config"
 	"github.com/Talin12/URL-Shortner/internal/httpapi"
+	"github.com/Talin12/URL-Shortner/internal/idgen"
+	"github.com/Talin12/URL-Shortner/internal/links"
 	"github.com/Talin12/URL-Shortner/internal/metrics"
 	"github.com/Talin12/URL-Shortner/internal/resolver"
+	"github.com/Talin12/URL-Shortner/internal/shortcode"
 	"github.com/Talin12/URL-Shortner/internal/store"
 )
 
@@ -76,7 +79,19 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
-	api := httpapi.New(db, res, sink, recorder, m, logger, cfg.BaseURL)
+	// One database write per ID block, none per link. Every instance derives
+	// identical codec keys from the shared seed, so a code means the same
+	// thing whichever replica issued it.
+	allocator := idgen.New(
+		func(ctx context.Context, size uint64) (uint64, error) {
+			return db.ClaimIDBlock(ctx, "links", size)
+		},
+		uint64(cfg.IDBlockSize),
+	)
+	creator := links.New(allocator, shortcode.NewCodec(cfg.CodeSeed), db)
+	logger.Info("id allocator ready", "block_size", cfg.IDBlockSize)
+
+	api := httpapi.New(db, creator, res, sink, recorder, m, logger, cfg.BaseURL)
 
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
