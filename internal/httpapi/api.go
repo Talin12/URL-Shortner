@@ -19,6 +19,12 @@ import (
 	"github.com/Talin12/URL-Shortner/internal/store"
 )
 
+// ClickReader reports click totals. Behind an interface because the counts
+// come from Postgres or ClickHouse depending on the configured sink.
+type ClickReader interface {
+	ClickCount(ctx context.Context, code string) (int64, error)
+}
+
 // LinkResolver resolves a code to its destination. The handler does not know
 // whether that answer came from an in-process cache, Redis or Postgres --
 // which is what lets the cache tiers be added, reordered or disabled without
@@ -35,6 +41,7 @@ const maxDestinationLen = 2048
 type API struct {
 	store    *store.Store
 	resolver LinkResolver
+	clicks   ClickReader
 	recorder analytics.Recorder
 	metrics  *metrics.Metrics
 	logger   *slog.Logger
@@ -42,10 +49,11 @@ type API struct {
 }
 
 // New builds an API. baseURL prefixes codes in creation responses.
-func New(s *store.Store, res LinkResolver, recorder analytics.Recorder, m *metrics.Metrics, logger *slog.Logger, baseURL string) *API {
+func New(s *store.Store, res LinkResolver, clicks ClickReader, recorder analytics.Recorder, m *metrics.Metrics, logger *slog.Logger, baseURL string) *API {
 	return &API{
 		store:    s,
 		resolver: res,
+		clicks:   clicks,
 		recorder: recorder,
 		metrics:  m,
 		logger:   logger,
@@ -180,7 +188,7 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clicks, err := a.store.ClickCount(r.Context(), code)
+	clicks, err := a.clicks.ClickCount(r.Context(), code)
 	if err != nil {
 		a.logger.Error("count clicks", "code", code, "err", err)
 		writeError(w, http.StatusInternalServerError, "could not read stats")

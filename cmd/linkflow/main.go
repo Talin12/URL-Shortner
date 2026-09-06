@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Talin12/URL-Shortner/internal/analytics"
+	"github.com/Talin12/URL-Shortner/internal/clickstore"
 	"github.com/Talin12/URL-Shortner/internal/config"
 	"github.com/Talin12/URL-Shortner/internal/httpapi"
 	"github.com/Talin12/URL-Shortner/internal/metrics"
@@ -55,7 +56,13 @@ func run(logger *slog.Logger) error {
 
 	m := metrics.New()
 
-	recorder := newRecorder(cfg, db, logger)
+	sink, closeSink, err := newClickSink(dialCtx, cfg, db, logger)
+	if err != nil {
+		return err
+	}
+	defer closeSink()
+
+	recorder := newRecorder(cfg, sink, logger)
 	m.WatchAnalytics(recorder.Stats)
 	logger.Info("analytics recorder ready", "mode", cfg.AnalyticsMode)
 
@@ -69,7 +76,7 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
-	api := httpapi.New(db, res, recorder, m, logger, cfg.BaseURL)
+	api := httpapi.New(db, res, sink, recorder, m, logger, cfg.BaseURL)
 
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
@@ -165,14 +172,52 @@ func newResolver(ctx context.Context, cfg config.Config, db *store.Store, m *met
 	}), nil
 }
 
+// clickSink is everything the service needs from a click event store: the
+// write side the batcher drives, and the read side the stats endpoint uses.
+type clickSink interface {
+	analytics.ClickWriter
+	httpapi.ClickReader
+}
+
+// newClickSink picks where click events land. Postgres is the phase 1-3
+// answer and stays the default; ClickHouse is phase 4, kept switchable so the
+// two can be measured against each other rather than argued about.
+func newClickSink(ctx context.Context, cfg config.Config, db *store.Store, logger *slog.Logger) (clickSink, func(), error) {
+	if cfg.AnalyticsSink != config.SinkClickHouse {
+		logger.Info("click sink ready", "sink", config.SinkPostgres)
+		return db, func() {}, nil
+	}
+
+	ch, err := clickstore.New(ctx, clickstore.Options{
+		Addr:     cfg.ClickHouseAddr,
+		Database: cfg.ClickHouseDatabase,
+		Username: cfg.ClickHouseUser,
+		Password: cfg.ClickHousePassword,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ch.Migrate(ctx); err != nil {
+		_ = ch.Close()
+		return nil, nil, err
+	}
+
+	logger.Info("click sink ready", "sink", config.SinkClickHouse, "addr", cfg.ClickHouseAddr)
+	return ch, func() {
+		if err := ch.Close(); err != nil {
+			logger.Error("clickhouse shutdown", "err", err)
+		}
+	}, nil
+}
+
 // newRecorder picks the click-recording strategy. Both live in the binary so
 // the phase 1 baseline and the phase 2 decoupled path can be compared on the
 // same hardware without rebuilding.
-func newRecorder(cfg config.Config, db *store.Store, logger *slog.Logger) analytics.Recorder {
+func newRecorder(cfg config.Config, sink clickSink, logger *slog.Logger) analytics.Recorder {
 	if cfg.AnalyticsMode == config.ModeSync {
-		return analytics.NewSync(db, logger)
+		return analytics.NewSync(sink, logger)
 	}
-	return analytics.NewBatch(db, logger, analytics.BatchConfig{
+	return analytics.NewBatch(sink, logger, analytics.BatchConfig{
 		BufferSize:    cfg.AnalyticsBuffer,
 		BatchSize:     cfg.AnalyticsBatchSize,
 		FlushInterval: cfg.AnalyticsFlushInterval,

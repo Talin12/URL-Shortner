@@ -40,6 +40,33 @@ services:
       timeout: 3s
       retries: 15
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: linkflow
+      CLICKHOUSE_USER: linkflow
+      CLICKHOUSE_PASSWORD: linkflow
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${LINKFLOW_CLICKHOUSE_PORT:-9000}:9000"
+      - "${LINKFLOW_CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    ulimits:
+      # ClickHouse opens a lot of files per part and warns loudly below this.
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      # Probes the container's own hostname, not localhost: ClickHouse binds
+      # 0.0.0.0 and ::, but busybox wget resolves "localhost" to ::1, which
+      # nothing is listening on -- so a localhost probe fails while the server
+      # is perfectly healthy.
+      test: ["CMD-SHELL", "wget --spider -q http://$$HOSTNAME:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   linkflow:
     build: .
     environment:
@@ -61,12 +88,21 @@ services:
       LINKFLOW_CACHE_TTL: "${LINKFLOW_CACHE_TTL:-10m}"
       LINKFLOW_SINGLEFLIGHT: "${LINKFLOW_SINGLEFLIGHT:-true}"
       LINKFLOW_ORIGIN_DELAY: "${LINKFLOW_ORIGIN_DELAY:-0}"
+      # "postgres" keeps click events beside the links; "clickhouse" moves
+      # them to the columnar store. Switchable so the migration is measured.
+      LINKFLOW_ANALYTICS_SINK: "${LINKFLOW_ANALYTICS_SINK:-postgres}"
+      LINKFLOW_CLICKHOUSE_ADDR: "clickhouse:9000"
+      LINKFLOW_CLICKHOUSE_DATABASE: "linkflow"
+      LINKFLOW_CLICKHOUSE_USER: "linkflow"
+      LINKFLOW_CLICKHOUSE_PASSWORD: "linkflow"
     ports:
       - "${LINKFLOW_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
@@ -107,5 +143,6 @@ services:
 
 volumes:
   postgres-data:
+  clickhouse-data:
   prometheus-data:
   grafana-data:

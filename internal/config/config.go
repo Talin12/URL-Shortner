@@ -58,12 +58,30 @@ type Config struct {
 	// a sub-millisecond local Postgres warms the cache before a herd can
 	// even form.
 	OriginDelay time.Duration
+
+	// AnalyticsSink selects where click events land: "postgres" or
+	// "clickhouse". Both are wired so the migration can be measured rather
+	// than asserted (PLAN.md section 3).
+	AnalyticsSink string
+	// ClickHouseAddr is host:port for the native protocol (9000, not 8123).
+	ClickHouseAddr string
+	// ClickHouseDatabase, ClickHouseUser and ClickHousePassword address the
+	// server.
+	ClickHouseDatabase string
+	ClickHouseUser     string
+	ClickHousePassword string
 }
 
 // Analytics recorder modes.
 const (
 	ModeBatch = "batch"
 	ModeSync  = "sync"
+)
+
+// Click event sinks.
+const (
+	SinkPostgres   = "postgres"
+	SinkClickHouse = "clickhouse"
 )
 
 // Load reads configuration from the environment, applying defaults for any
@@ -121,6 +139,15 @@ func Load() (Config, error) {
 	if cfg.OriginDelay, err = envDuration("LINKFLOW_ORIGIN_DELAY", 0); err != nil {
 		return Config{}, err
 	}
+
+	cfg.AnalyticsSink = env("LINKFLOW_ANALYTICS_SINK", SinkPostgres)
+	if cfg.AnalyticsSink != SinkPostgres && cfg.AnalyticsSink != SinkClickHouse {
+		return Config{}, fmt.Errorf("config: LINKFLOW_ANALYTICS_SINK must be %q or %q, got %q", SinkPostgres, SinkClickHouse, cfg.AnalyticsSink)
+	}
+	cfg.ClickHouseAddr = env("LINKFLOW_CLICKHOUSE_ADDR", "localhost:9000")
+	cfg.ClickHouseDatabase = env("LINKFLOW_CLICKHOUSE_DATABASE", "linkflow")
+	cfg.ClickHouseUser = env("LINKFLOW_CLICKHOUSE_USER", "linkflow")
+	cfg.ClickHousePassword = env("LINKFLOW_CLICKHOUSE_PASSWORD", "linkflow")
 
 	return cfg, nil
 }

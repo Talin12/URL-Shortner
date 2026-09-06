@@ -6,6 +6,7 @@ VUS ?= 100
 DURATION ?= 60s
 ZIPF_S ?= 1.2
 ANALYTICS_MODE ?= batch
+ANALYTICS_SINK ?= postgres
 STAMPEDE_N ?= 10000
 TEST_DATABASE_URL ?= postgres://linkflow:linkflow@localhost:5433/linkflow_test?sslmode=disable
 
@@ -46,8 +47,9 @@ fmt: ## Format all Go source
 check: fmt vet test ## Format, vet and test
 
 .PHONY: up
-up: ## Start the stack (ANALYTICS_MODE=batch|sync)
-	LINKFLOW_ANALYTICS_MODE=$(ANALYTICS_MODE) docker compose up --build -d
+up: ## Start the stack (ANALYTICS_MODE=batch|sync, ANALYTICS_SINK=postgres|clickhouse)
+	LINKFLOW_ANALYTICS_MODE=$(ANALYTICS_MODE) LINKFLOW_ANALYTICS_SINK=$(ANALYTICS_SINK) \
+		docker compose up --build -d
 
 .PHONY: down
 down: ## Stop the stack, keeping the Postgres volume
