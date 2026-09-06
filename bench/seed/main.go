@@ -67,6 +67,15 @@ func main() {
 		}
 	}
 
+	// Refuse to write a key set the benchmark cannot use. A k6 run over zero
+	// codes still reports a throughput number -- one made entirely of errors.
+	if len(kept) == 0 {
+		log.Fatalf("every one of the %d link creations failed; is the service running at %s?", *count, *baseURL)
+	}
+	if int64(len(kept)) < int64(*count)/2 {
+		log.Fatalf("only %d of %d link creations succeeded; refusing to write a half-empty key set", len(kept), *count)
+	}
+
 	body, err := json.Marshal(kept)
 	if err != nil {
 		log.Fatalf("encode codes: %v", err)

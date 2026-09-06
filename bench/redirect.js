@@ -29,6 +29,12 @@ const DURATION = __ENV.DURATION || '60s';
 // only once and shared, so the CDF build below is the only per-VU cost.
 const codes = JSON.parse(open(CODES_FILE));
 
+// A run over zero keys still produces a throughput number: 100% errors at
+// several tens of thousands of "requests" per second. Fail instead.
+if (!Array.isArray(codes) || codes.length === 0) {
+  throw new Error(`${CODES_FILE} holds no codes -- run the seeder first`);
+}
+
 // Inverse-transform sampling needs a cumulative distribution. Zipf weight for
 // rank i is 1/i^s; normalising gives the CDF we binary-search per request.
 const cdf = buildZipfCDF(codes.length, ZIPF_S);

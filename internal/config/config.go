@@ -99,7 +99,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	cfg.RedisAddr = env("LINKFLOW_REDIS_ADDR", "localhost:6379")
+	// Present-but-empty means "no shared tier", which is different from unset.
+	// The plain env() helper cannot express that, and treating empty as unset
+	// silently re-enabled Redis on a run meant to measure life without it.
+	cfg.RedisAddr = envAllowEmpty("LINKFLOW_REDIS_ADDR", "localhost:6379")
 	if cfg.RedisPoolSize, err = envInt("LINKFLOW_REDIS_POOL_SIZE", 50); err != nil {
 		return Config{}, err
 	}
@@ -144,6 +147,16 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s must be a duration such as 200ms: %w", key, err)
 	}
 	return d, nil
+}
+
+// envAllowEmpty returns the variable's value whenever it is set, including an
+// empty string. Use it where empty is a meaningful choice rather than an
+// absent one.
+func envAllowEmpty(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return fallback
 }
 
 func env(key, fallback string) string {
