@@ -23,7 +23,9 @@ Two consequences that matter for almost every change:
 
 ## Build phase status
 
-`PLAN.md` §6 defines six phases. Current state: **phases 1-4 complete.**
+`PLAN.md` §6 defines six phases. Current state: **all six complete.** The
+README is the deliverable; treat it as the source of truth for what has
+actually been measured.
 
 Phase 1's synchronous recorder is still in the binary, selected by
 `LINKFLOW_ANALYTICS_MODE=sync`. It is not dead code — it is the control arm.
@@ -35,11 +37,14 @@ Still *deliberately naive*, by plan. If you are about to "improve" one of these
 without being asked, check the phase plan first — the naive version exists so
 later phases have a before-number to beat:
 
-| Still naive | Replaced by |
+Known gaps, none of which are accidents:
+
+| Gap | Status |
 |---|---|
-| `nextval()` per creation, sequential/enumerable codes | Phase 5: block allocator + Feistel bijection (§5.4) |
-| Single instance | Phase 5: 3 replicas behind nginx |
-| At-most-once analytics | Phase 5 (optional): Redis Streams between batcher and sink |
+| At-most-once analytics | `PLAN.md` marks Redis Streams optional; not built |
+| 1-vs-3 replica throughput | Benchmark never completed; no scaling number is claimed |
+| Load generator shares the service's host | The largest remaining flaw in every number |
+| No auth, rate limiting or URL reputation checks | Out of scope per §7 — but it means this must not be exposed publicly |
 
 Every switchable behaviour exists so a design claim can be *measured* rather
 than asserted. Do not remove one because it looks like dead code:
@@ -51,6 +56,8 @@ than asserted. Do not remove one because it looks like dead code:
 | `LINKFLOW_REDIS_ADDR` | `""` | What the shared tier is worth |
 | `LINKFLOW_SINGLEFLIGHT` | `false` | The stampede control arm |
 | `LINKFLOW_ANALYTICS_SINK` | `postgres` | The ClickHouse migration |
+| `LINKFLOW_ID_BLOCK_SIZE` | — | Database writes per link created |
+| `LINKFLOW_CODE_SEED` | — | Must match across replicas; changing it invalidates every code |
 | `LINKFLOW_ORIGIN_DELAY` | `0` | Benchmark-only: makes a stampede reproducible |
 
 **Measured results that should shape new work** (details in the README):
@@ -62,6 +69,13 @@ than asserted. Do not remove one because it looks like dead code:
 - Postgres dropped 1.08% of click events at high ingest; ClickHouse dropped
   none and stored the same data in 1/50th the space. Throughput and latency
   alone said Postgres was fine — only the drop counters showed the problem.
+- 20,000 concurrent creations across 3 instances cost 3 database writes and
+  produced 0 duplicate codes, with no collision check in the path.
+
+**Before trusting any benchmark here, read the README's "What I got wrong".**
+Five separate harness bugs produced plausible numbers rather than errors,
+including a stampede test that reported the correct answer with the feature
+disabled. Any new measurement needs a control arm that is expected to fail.
 
 ## Commands
 

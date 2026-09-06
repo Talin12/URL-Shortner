@@ -9,8 +9,9 @@ your write path. **linkflow is a read path that stays fast while a high-volume,
 loss-tolerant write path runs underneath it, with the two decoupled
 deliberately and the trade-off measured.**
 
-Built in phases, each ending with numbers. This README reports what has
-actually been measured, not what the design is expected to achieve.
+Built in six phases, each ending with numbers taken on the same machine in the
+same session. **This README reports what was measured, including the three
+times the measurement contradicted the design.**
 
 ---
 
@@ -22,12 +23,22 @@ actually been measured, not what the design is expected to achieve.
 | 2 | Bounded channel + batcher goroutine, drop policy | **Done — numbers below** |
 | 3 | Ristretto → Redis → Postgres, singleflight, Prometheus | **Done — and it made things slower** |
 | 4 | ClickHouse for click events | **Done — numbers below** |
-| 5 | Multi-instance, block ID allocator, durability | Not started |
+| 5 | Multi-instance, block ID allocator, non-enumerable codes | **Done — verified below** |
+| 6 | The write-up | **This document** |
 
-Both analytics strategies ship in the same binary, selected by
-`LINKFLOW_ANALYTICS_MODE`. Phase 1's synchronous recorder is not dead code — it
-is the control arm, and keeping it means every phase comparison is one binary
-on one machine in one session rather than two builds measured weeks apart.
+Every phase's alternative is still in the binary behind an environment
+variable. Phase 1's synchronous recorder is not dead code — it is the control
+arm, and keeping all of them means each comparison is one binary on one machine
+in one session rather than two builds measured weeks apart.
+
+**The short version of what was learned**, before the detail:
+
+| Phase | Expected | Measured |
+|---|---|---|
+| 2 | Decoupling helps | 2.3× throughput at equal p99, costing 0.157% of events |
+| 3 | Cache helps | **27% slower** against a fast origin; 2.4× faster against a slow one |
+| 4 | ClickHouse is faster | Throughput unchanged; Postgres silently **dropped 1.08% of events** |
+| 5 | Allocator scales creation | 20,000 concurrent creations, 3 database writes, 0 duplicates |
 
 ---
 
@@ -244,6 +255,63 @@ Methodology.
 
 ---
 
+## Results — phase 5: creation without coordination
+
+Three instances behind nginx, sharing one Postgres and one Redis. The question
+is not throughput — it is whether the ID allocator's only coordination point,
+a single database row, actually holds when three processes hammer it.
+
+**20,000 links created concurrently through nginx, 100 concurrent creators:**
+
+```
+created:      20000 links in 1.674s (11947/s), 0 failed
+unique codes: 20000 of 20000
+code length:  3 chars: 4, 4 chars: 63, 5 chars: 4144, 6 chars: 15789
+enumerable:   0 of 19999 consecutive pairs share a prefix (0.000%)
+```
+
+| Property | Result |
+|---|---|
+| Duplicate codes | **0** — with no collision check anywhere in the path |
+| Database writes for 20,001 links | **3** (`id_blocks.next_id`: 1,000,000 → 1,030,000) |
+| Consecutive codes sharing a prefix | **0 of 19,999** |
+| Code issued by one replica, resolved through nginx | 60/60 → 302 |
+| Load distribution across replicas | 100 / 100 / 100 |
+
+**One database write per 10,000 links, and none at all in between.** Phase 1
+took a round trip per creation; this takes one `UPDATE` per block and then
+serves from an atomic cursor in memory. The row lock that `UPDATE` takes is the
+entire cross-instance coordination mechanism.
+
+Uniqueness holds with **no collision check, no retry loop and no lookup table**,
+because there is nothing to collide: IDs are unique by allocation, and a
+Feistel network is a bijection by construction, so distinct IDs cannot produce
+the same code.
+
+### Why a Feistel network rather than a hash
+
+Block-allocated IDs are sequential, and base62 of a sequential ID is
+sequential — `/aB3` and `/aB4` would both be real links, and anyone could walk
+the keyspace reading other people's destinations. That is a security problem
+created by a performance decision, which is what makes it interesting.
+
+| Approach | Problem |
+|---|---|
+| Hash the ID | Reintroduces collisions, so back to a per-creation check |
+| Random code + collision check | The database round trip the allocator just removed |
+| Lookup table | The coordination the allocator just removed |
+| **Feistel permutation** | Bijective by construction: unique, scattered, stateless |
+
+Verified collision-free over a contiguous run of 2^20 IDs — the exact shape the
+allocator produces — and invertible over 200,000 random values. Codes stay at
+most 6 characters because the permuted domain is 2^32 and 62^6 > 2^32.
+
+*Not measured:* whether three instances serve more redirect throughput than one.
+That benchmark was started and stopped before it completed, so the scaling
+claim is unverified and no number for it appears here.
+
+---
+
 ## Architecture
 
 ```
@@ -403,17 +471,36 @@ counted as `dropped_after_close` rather than lost silently. A `SIGKILL` still
 loses whatever is buffered — that is the durability cost of returning the 302
 early, and phase 5 optionally buys it back with Redis Streams.
 
-### Short codes are enumerable, and that is a known phase 1 debt
+### The allocator's cursor and bounds must be one object
 
-Codes come from a Postgres sequence, base62-encoded. This costs a round trip
-per creation and means `/aB3` and `/aB4` are both real links — anyone can walk
-the keyspace and read other people's destinations.
+The first version of the block allocator kept the cursor and the block end in
+two separate atomics. That tears. A reader can observe the **new** end
+alongside the **old** cursor and return an ID from the previous, exhausted
+range — an ID that by then belongs to a different instance's block. The
+symptom would be duplicate short codes appearing rarely, under load, across
+instances: close to undebuggable in production.
 
-Both problems have the same fix (`PLAN.md` §5.4): pre-allocated ID blocks
-remove the per-creation coordination, and a Feistel bijection applied before
-base62 scatters the output so sequential IDs stop producing sequential codes.
-`CreateLink` already takes the encoder as a function argument, so that lands
-without touching SQL.
+Both now live in one immutable `block` swapped by a single pointer store, so
+the window cannot exist. A 50-goroutine test with deliberately tiny blocks
+failed on the first run and is what caught it.
+
+IDs are deliberately **not dense**. Callers racing past the end of a block burn
+the IDs they drew, and a restart abandons the rest of a block. Nothing requires
+IDs to be contiguous, and the permutation scatters them before anyone sees
+them.
+
+### nginx: `proxy_pass` through a variable silently disables keepalive
+
+The upstream was originally proxied through a variable so nginx would
+re-resolve Docker DNS per request. That form bypasses the `upstream` block
+entirely — which is where `keepalive` is configured — so nginx opened a fresh
+TCP connection for every request. Measured cost: **1,645 req/s at p50 73 ms
+with 3,120 sockets in TIME_WAIT**, against tens of thousands per second
+directly against the service.
+
+The named upstream resolves once at startup and expands every A record into a
+round-robin peer. The trade is that scaling replicas needs an nginx reload; at
+a fixed replica count that is obviously the right side of it.
 
 ### Only http and https destinations
 
@@ -444,6 +531,17 @@ make bench-ramp
 make clean && make up ANALYTICS_MODE=sync
 make seed SEED_COUNT=10000
 make bench-ramp
+
+# phase 3: the stampede claim, with and without the fix
+LINKFLOW_ORIGIN_DELAY=5ms make up && make stampede
+LINKFLOW_ORIGIN_DELAY=5ms LINKFLOW_SINGLEFLIGHT=false make up && make stampede
+
+# phase 4: click events to ClickHouse instead of Postgres
+make clean && make up ANALYTICS_SINK=clickhouse && make bench-ramp
+
+# phase 5: three instances, then verify the allocator holds
+make cluster REPLICAS=3
+make allocator-check CREATE_N=20000
 ```
 
 - **Zipf(s=1.2), not uniform.** Real link traffic is heavily skewed. A uniform
@@ -480,6 +578,60 @@ prerequisite for any number that goes on a resume.
 | Buffer fills | Overflow is dropped and counted. Redirects never block. |
 | SIGTERM | HTTP drains first, then the buffer flushes within the shutdown timeout. Late arrivals count as `dropped_after_close`. Final tallies are logged. |
 | SIGKILL | Up to 10,000 buffered events are lost, silently — the process is gone before it can count them. This is the price of returning the 302 early. |
+| One instance dies | nginx routes around it. The dead instance abandons the unused remainder of its ID block; IDs are not required to be contiguous, so nothing else notices. |
+| Two instances start against an empty database | Both run `IF NOT EXISTS` migrations concurrently. Idempotent, but unguarded — a versioned migration tool with an advisory lock is the correct answer. |
+| nginx dies | Total outage. It is a single point of failure in this topology, unreplicated. |
+
+---
+
+## What I got wrong
+
+`PLAN.md` §10 ends with "what did you get wrong the first time?" and notes that
+the people who claim nothing are the ones who did not measure anything. Here is
+the list, kept because the failure mode it illustrates is the important one:
+**five of these bugs produced a plausible number rather than an error.**
+
+### The harness lied before the service did
+
+| Bug | What it reported | Why it was wrong |
+|---|---|---|
+| Stampede tool followed redirects | `404: 10000` | Go's HTTP client follows 302s by default, so it measured example.com, not us |
+| Stampede tool dialled inside the measurement | "1 database query" — **with the fix disabled** | 10,000 connections take ~1.9 s to establish; the first query finished and warmed the cache before the herd formed |
+| Empty env var treated as unset | Service exited on a run measuring life without Redis | `LINKFLOW_REDIS_ADDR=""` fell through to the `localhost` default, so "disable Redis" was inexpressible |
+| Seeder wrote an empty key set anyway | **71,051 req/s** | Every creation had failed. The throughput was 100% errors against zero keys |
+| No warm-up discarded | 6,748 req/s, max latency **138 seconds** | First run after container start; a cold-start artifact sitting in the results table |
+
+The second one is the one worth dwelling on. It reported the *correct* answer —
+one query — for the *wrong* reason, and it reported it for both the treated and
+control arms. A test that passes when the feature is switched off is not
+evidence of anything, and only checking the control arm exposed it.
+
+### Two correctness bugs the tests caught
+
+- **The allocator tore.** Cursor and block-end in separate atomics meant a
+  reader could combine the new end with the old cursor and return an ID from
+  another instance's block. Duplicate short codes, rarely, under load, across
+  processes. A 50-goroutine test with tiny blocks failed immediately.
+- **nginx opened a TCP connection per request.** `proxy_pass` through a
+  variable bypasses the `upstream` block where `keepalive` lives. 1,645 req/s
+  and 3,120 sockets in TIME_WAIT — visible only because the number was
+  implausible enough to chase.
+
+### And one that had nothing to do with measurement
+
+`.gitignore` contained `linkflow` to ignore the built binary. Unanchored
+patterns match at any depth, so it silently excluded the `cmd/linkflow/`
+**source** directory. The repository was pushed without a `main` package and
+could not have built. `git add cmd` had reported success.
+
+### The pattern
+
+Every one of these was caught by asking "is this number believable?" rather
+than by a test failing. The lesson that generalises: **a benchmark harness
+needs its own control arm, and a result that cannot fail is not a result.** The
+codebase now refuses to produce several of these — the seeder will not write an
+unusable key set, k6 will not start without one — but the general problem is
+not solved by better assertions, only by suspicion.
 
 ---
 
@@ -513,10 +665,40 @@ Honest limitations of the current state:
 - **A failed batch is dropped whole**, with no retry and no dead-letter path.
   For 1,000 events that is a bigger blast radius per failure than the
   synchronous recorder had.
-- **Codes are enumerable.** See above.
 - **Migrations run on boot with `IF NOT EXISTS`.** Fine for one instance,
   wrong for several starting concurrently against an empty database.
-- Single region, no rate limiting, no auth on link creation.
+- **Horizontal scaling is unverified.** Three instances run correctly and
+  share work evenly, but the 1-vs-3 throughput benchmark was never completed,
+  so there is no number behind "it scales".
+- **nginx is a single point of failure**, and the codec seed is a
+  configuration value that silently invalidates every existing code if it
+  changes.
+- **Not production-ready, deliberately.** No auth on link creation, no rate
+  limiting, no URL reputation checks. A public shortener with those gaps
+  becomes a phishing relay within days; `PLAN.md` §7 rules that work out of
+  scope on purpose, and the honest consequence is that this should not be
+  exposed to the internet as it stands.
+- Single region.
+
+---
+
+## What this project actually demonstrates
+
+Not that a URL shortener can be fast — a single indexed lookup was always going
+to be fast, which is why `PLAN.md` opens by saying the redirect is not the
+achievement.
+
+What it demonstrates is a read path held at sub-11 ms p99 while a
+three-million-event write path runs underneath it, with the interference
+between them removed deliberately and the cost of that removal stated as a
+number rather than waved away. And, more usefully: three cases where running
+the experiment produced the opposite of the expected answer, and the write-up
+says so instead of quietly re-tuning until the graph agreed.
+
+The cache section is the one worth reading. It cost 27% of throughput, and the
+honest conclusion — that a cache is a bet about the origin's latency, and this
+benchmark's origin was too fast for the bet to pay — is more useful than any
+number where it wins.
 
 ---
 
@@ -525,3 +707,5 @@ Honest limitations of the current state:
 1. [`PLAN.md`](PLAN.md) — the spec, the phase plan, and the reasoning behind
    every constraint above.
 2. [`CLAUDE.md`](CLAUDE.md) — conventions and the layout of the packages.
+3. The switches in [Quick start](#quick-start) — every claim above can be
+   re-run with the feature turned off.
