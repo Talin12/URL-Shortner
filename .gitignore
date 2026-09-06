@@ -1,0 +1,22 @@
+# Build output
+bin/
+linkflow
+
+# Benchmark artifacts -- results are pasted into the README with their context,
+# the raw dumps are not worth versioning.
+bench/codes.json
+bench/results/
+
+# Profiles
+*.prof
+*.pprof
+*.test
+
+# Local environment
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
