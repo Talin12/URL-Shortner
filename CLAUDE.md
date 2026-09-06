@@ -23,7 +23,7 @@ Two consequences that matter for almost every change:
 
 ## Build phase status
 
-`PLAN.md` §6 defines six phases. Current state: **phases 1-3 complete.**
+`PLAN.md` §6 defines six phases. Current state: **phases 1-4 complete.**
 
 Phase 1's synchronous recorder is still in the binary, selected by
 `LINKFLOW_ANALYTICS_MODE=sync`. It is not dead code — it is the control arm.
@@ -37,9 +37,9 @@ later phases have a before-number to beat:
 
 | Still naive | Replaced by |
 |---|---|
-| Click events in Postgres | Phase 4: ClickHouse, after documenting how Postgres fails |
 | `nextval()` per creation, sequential/enumerable codes | Phase 5: block allocator + Feistel bijection (§5.4) |
 | Single instance | Phase 5: 3 replicas behind nginx |
+| At-most-once analytics | Phase 5 (optional): Redis Streams between batcher and sink |
 
 Every switchable behaviour exists so a design claim can be *measured* rather
 than asserted. Do not remove one because it looks like dead code:
@@ -50,7 +50,18 @@ than asserted. Do not remove one because it looks like dead code:
 | `LINKFLOW_LOCAL_CACHE_ITEMS` | `0` | What the in-process tier is worth |
 | `LINKFLOW_REDIS_ADDR` | `""` | What the shared tier is worth |
 | `LINKFLOW_SINGLEFLIGHT` | `false` | The stampede control arm |
+| `LINKFLOW_ANALYTICS_SINK` | `postgres` | The ClickHouse migration |
 | `LINKFLOW_ORIGIN_DELAY` | `0` | Benchmark-only: makes a stampede reproducible |
+
+**Measured results that should shape new work** (details in the README):
+
+- The cache *costs* throughput against a fast local origin (26.3k → 19.0k
+  req/s) and pays 2.4× against a 5 ms one. Do not "fix" a cache benchmark by
+  making the origin faster.
+- Singleflight absorbed 54% of load with no cache at all, under Zipf skew.
+- Postgres dropped 1.08% of click events at high ingest; ClickHouse dropped
+  none and stored the same data in 1/50th the space. Throughput and latency
+  alone said Postgres was fine — only the drop counters showed the problem.
 
 ## Commands
 
@@ -97,6 +108,7 @@ make bench-ramp        # sweep 25→800 VUs to find the knee
 ```
 cmd/linkflow/          entrypoint: config → store → recorder → API → graceful shutdown
 internal/config/       env-var config, defaults matching docker-compose
+internal/clickstore/   ClickHouse click event sink, schema and rollup
 internal/metrics/      Prometheus collectors on a private registry
 internal/resolver/     two-tier cache + singleflight + origin fallback
 internal/store/        all Postgres access; owns the embedded schema

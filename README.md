@@ -20,8 +20,8 @@ actually been measured, not what the design is expected to achieve.
 |---|---|---|
 | 1 | Baseline: Go + Postgres, synchronous click writes | **Done — the control arm** |
 | 2 | Bounded channel + batcher goroutine, drop policy | **Done — numbers below** |
-| 3 | Ristretto → Redis → Postgres, singleflight, Prometheus | Not started |
-| 4 | ClickHouse for click events | Not started |
+| 3 | Ristretto → Redis → Postgres, singleflight, Prometheus | **Done — and it made things slower** |
+| 4 | ClickHouse for click events | **Done — numbers below** |
 | 5 | Multi-instance, block ID allocator, durability | Not started |
 
 Both analytics strategies ship in the same binary, selected by
@@ -102,6 +102,136 @@ you want.
 Batch also ingested **2.2× more events** (3.09 M vs 1.40 M) in the same wall
 time, simply because it served 2.2× more redirects.
 
+## Results — phase 3: the cache that made things slower
+
+Three cache configurations, same Zipf(s=1.2) load over 10,000 keys, fresh
+database per arm. The local tier holds 1,000 entries — 10% of the keyspace, so
+skew has to do the work.
+
+| VUs | no cache | Redis only | two-tier |
+|---:|---:|---:|---:|
+| 50 | **26,277 req/s** | 17,465 req/s | 18,960 req/s |
+| 100 | **24,980 req/s** | 18,091 req/s | 19,156 req/s |
+| 200 | **21,141 req/s** | 18,415 req/s | 15,158 req/s |
+
+**Adding a cache cost 27% of throughput.** Not the expected result, and worth
+stating plainly rather than tuning until the graph flatters the design.
+
+The reason is in the setup: the origin is a 10,000-row table sitting entirely
+in Postgres' shared buffers, on the same host, reached over loopback. That
+lookup takes on the order of 0.1 ms. A Redis round trip through Docker's
+network stack costs more than the query it is meant to avoid, and on a miss the
+service pays *both* — Redis lookup, Postgres query, then a Redis write to
+populate. PLAN.md §1 says it outright: "Postgres will do that in under a
+millisecond without you doing anything clever."
+
+### The same test with a slow origin
+
+Re-run with 5 ms injected into the origin query — a database that is loaded,
+or simply not on the same machine. Nothing else changed. 100 VUs:
+
+| | no cache | two-tier | change |
+|---|---:|---:|---:|
+| Throughput | 12,759 req/s | **30,757 req/s** | **+141%** |
+| p50 | 7.52 ms | 2.88 ms | −62% |
+| p99 | 17.26 ms | 10.00 ms | −42% |
+| Postgres queries | 197,786 | **9,920** | −95% |
+
+**The cache is worth nothing at 0.1 ms origin latency and worth 2.4× at 5 ms.**
+That is the actual finding, and it is more useful than a graph showing the
+cache always wins: a cache is a bet that the origin is slow or far away, and
+this benchmark's origin is neither.
+
+### What the tiers actually did
+
+Under Zipf(1.2), a local cache holding **10% of the keyspace absorbed 42.7%**
+of all lookups (394,196 hits against 528,589 misses). That is TinyLFU admission
+doing what an LRU would not: keeping the hot set resident instead of letting a
+scan of cold keys evict it.
+
+Singleflight turned out to matter more than either cache tier. With **no cache
+at all** and a slow origin, it collapsed 229,323 concurrent requests into the
+197,786 queries that actually ran — **54% of load absorbed** by deduplication
+alone, purely because Zipf skew means many simultaneous requests want the same
+key.
+
+### The stampede, measured
+
+The claim in PLAN.md §5.2 is that concurrent misses for one key should collapse
+into a single origin query. `make stampede` fires N simultaneous requests at a
+freshly created code and reads `linkflow_origin_queries_total` either side:
+
+| | simultaneous cold misses | Postgres queries |
+|---|---:|---:|
+| singleflight **on** | 216 | **1** |
+| singleflight **off** | 251 | **242** |
+
+Getting an honest number here took two fixes to the harness, both of which had
+been quietly producing a passing result:
+
+1. **The tool followed redirects**, so it reported example.com's 404 rather
+   than our 302.
+2. **It dialled connections after the barrier.** Establishing 10,000
+   connections takes ~1.9 s, the first query finished long before the rest
+   arrived, and the cache warmed — so the stampede never formed and *both*
+   arms reported one query. Pre-establishing the connections is what made it a
+   stampede.
+
+The origin delay exists for the same reason: against a sub-millisecond
+Postgres, the cache warms before a herd can form, and the test measures the
+load generator instead of the service.
+
+---
+
+## Results — phase 4: Postgres vs ClickHouse ingest
+
+Same load against both click event sinks, fresh volumes between arms. The
+redirect path is identical in both; only where click events land changes.
+
+| VUs | Postgres req/s | ClickHouse req/s | Postgres p99 | ClickHouse p99 |
+|---:|---:|---:|---:|---:|
+| 100 | *(outlier, see below)* | 30,710 | — | 8.99 ms |
+| 200 | 32,868 | 30,884 | 16.23 ms | 16.75 ms |
+| 400 | 31,240 | 26,011 | 35.16 ms | 41.32 ms |
+
+**Throughput is not the story — Postgres is fine, and at 400 VUs it is
+slightly ahead.** The story is what happened underneath:
+
+| | Postgres | ClickHouse |
+|---|---:|---:|
+| Events accepted | 3,058,099 | 2,628,759 |
+| Events written | 3,025,183 | 2,628,759 |
+| **Events dropped (buffer full)** | **32,916 (1.08%)** | **0 (0.00%)** |
+| Storage on disk | 440 MB | **7.33 MiB** |
+| Bytes per event | ~145 | **~2.9** |
+
+**Postgres could not drain the buffer fast enough and lost 1.08% of events.
+ClickHouse lost none.** That is the ingest bottleneck the migration was for,
+and it is visible only because the drop counters exist — throughput and latency
+alone would have said Postgres was winning.
+
+The storage difference is 50×. Same events, same count of columns: 440 MB
+against 7.33 MiB. Columnar storage plus compression on data that is mostly
+repeated codes and near-identical user agents is exactly the workload this
+trade is designed for.
+
+The rollup matters too. `click_counts_daily` is maintained on insert by a
+materialized view, so `/api/links/{code}/stats` sums a handful of pre-aggregated
+rows rather than scanning raw events. Counts always `SUM`: SummingMergeTree
+collapses rows in the background, so before a merge one code legitimately has
+several rows.
+
+### The discarded data point
+
+The first Postgres run reported 6,748 req/s with a **max latency of 138
+seconds** — a single request that stalled for over two minutes. It is the first
+k6 run after container start, and the methodology below says no warm-up is
+discarded, so it landed in the data. It is excluded from the comparison above
+as a cold-start artifact, and it is a direct argument for adding a discarded
+warm-up period rather than pretending the number is meaningful.
+
+---
+
 ### Note on the phase 1 numbers
 
 An earlier phase 1 ramp in a separate session recorded higher sync throughput
@@ -126,9 +256,10 @@ Methodology.
               READ PATH                            WRITE PATH
                     │                                   │
         ┌───────────▼───────────┐          ┌────────────▼────────────┐
-        │ Postgres              │          │ Bounded chan (10k)      │
-        │ point lookup on code  │          │ non-blocking send       │
-        │ source of truth       │          │ full → drop + count     │
+        │ 1. Ristretto (local)  │          │ Bounded chan (10k)      │
+        │ 2. Redis (shared)     │          │ non-blocking send       │
+        │ 3. Postgres (origin)  │          │ full → drop + count     │
+        │    singleflight on 3  │          │                         │
         └───────────┬───────────┘          └────────────┬────────────┘
                     │                                   │
                     │                       ┌───────────▼────────────┐
@@ -137,16 +268,15 @@ Methodology.
                     │                       └───────────┬────────────┘
                     │                                   │
                     │                       ┌───────────▼────────────┐
-                    │                       │ Postgres COPY          │
-                    │                       │ (ClickHouse in ph. 4)  │
+                    │                       │ ClickHouse batch insert│
+                    │                       │ (or Postgres COPY)     │
                     │                       └────────────────────────┘
                     │
               302 returned before the click event is durable
 ```
 
 That last line is the design. The response goes out as soon as the destination
-is known; at that moment the click event exists only in memory. Phase 3 adds
-the cache tiers on the left, phase 4 replaces the sink on the right.
+is known; at that moment the click event exists only in memory.
 
 The full target shape is in [`PLAN.md`](PLAN.md) §4.
 
@@ -166,11 +296,26 @@ curl localhost:8080/api/links/Q0u/stats
 make stats                       # analytics counters, including drops
 ```
 
-To run the phase 1 control arm instead of the decoupled write path:
+The stack includes Redis, ClickHouse, Prometheus and a provisioned Grafana
+dashboard at `http://localhost:3000/d/linkflow-overview` (`make grafana`).
+
+Every design claim has a switch so it can be measured rather than asserted:
 
 ```bash
-make up ANALYTICS_MODE=sync
+make up ANALYTICS_MODE=sync           # phase 1 control: synchronous click writes
+make up ANALYTICS_SINK=clickhouse     # phase 4: click events to ClickHouse
+make stampede                         # 10k concurrent requests at a cold key
+make cache-stats                      # per-tier hit counters
 ```
+
+| Variable | Off value | What it isolates |
+|---|---|---|
+| `LINKFLOW_ANALYTICS_MODE` | `sync` | The decoupled write path |
+| `LINKFLOW_ANALYTICS_SINK` | `postgres` | The ClickHouse migration |
+| `LINKFLOW_LOCAL_CACHE_ITEMS` | `0` | The in-process tier |
+| `LINKFLOW_REDIS_ADDR` | `""` | The shared tier |
+| `LINKFLOW_SINGLEFLIGHT` | `false` | Stampede protection |
+| `LINKFLOW_ORIGIN_DELAY` | `0` | Benchmark only: makes a stampede reproducible |
 
 Port 5432 is usually taken by a local Postgres install, so compose publishes
 the container on **5433** by default. Override with `LINKFLOW_POSTGRES_PORT`
@@ -187,6 +332,7 @@ and `LINKFLOW_PORT`.
 | `GET` | `/healthz` | Liveness — does not touch Postgres |
 | `GET` | `/readyz` | Readiness — pings Postgres |
 | `GET` | `/debug/analytics` | Recorder counters: accepted, written, dropped |
+| `GET` | `/metrics` | Prometheus exposition |
 
 `healthz` and `readyz` are split on purpose: an instance that has lost its
 database should be pulled from the load balancer, not restarted.
@@ -325,7 +471,9 @@ prerequisite for any number that goes on a resume.
 
 | Failure | Behaviour (batch mode) |
 |---|---|
-| Postgres unreachable | Redirects 500 — no cache yet, so the read path has nothing to fall back on. `/readyz` fails, `/healthz` still passes, so a load balancer pulls the instance without a restart loop. |
+| Postgres unreachable | Redirects served from cache keep working until entries expire; anything that misses returns 500. `/readyz` fails, `/healthz` still passes, so a load balancer pulls the instance without a restart loop. |
+| Redis unreachable | Counted as `linkflow_shared_cache_errors_total` and stepped past to the origin. Costs latency, not availability. |
+| ClickHouse unreachable | Batches fail, events count as `dropped_write_failed`. Redirects unaffected. |
 | Postgres slow *for writes* | Redirects unaffected. Batches stall, the buffer fills, and events start dropping with `dropped_buffer_full` climbing. Exactly the intended degradation. |
 | Postgres slow *for reads* | Redirect latency degrades with it. Phase 3's cache tiers are the answer. |
 | Click batch fails | All events in that batch are counted `dropped_write_failed`. No retry — a retry queue is unbounded work in front of an already-failing database. |
@@ -345,13 +493,20 @@ Honest limitations of the current state:
   what rescues the phase 2 result; a dedicated load host is what would rescue
   the absolute numbers.
 - **Buffer size, batch size and flush interval were not tuned.** They are the
-  values PLAN.md suggested. The 0.157% drop rate might well go to zero with a
-  larger buffer, at the cost of losing more on a crash — that trade has not
-  been measured.
-- **No caching at all**, so the read path is one Postgres query per redirect
-  and nothing protects the database from a hot key. This is now the dominant
-  bottleneck — with the write path decoupled, the remaining ceiling is read
-  contention on Postgres.
+  values PLAN.md suggested. Postgres dropped 1.08% of events at high ingest
+  and a larger buffer might absorb that, at the cost of losing more on a
+  crash — that trade has not been measured.
+- **No warm-up is discarded**, which let a 138-second cold-start outlier into
+  the phase 4 data. It is excluded and flagged, but the harness should be
+  discarding a warm-up window instead of relying on me to notice.
+- **The cache is not justified by this benchmark.** It costs throughput
+  against a fast local origin and only pays when the origin is slow. Shipping
+  it anyway is a bet about production, not a conclusion from the data — and
+  the honest version of that sentence belongs in the README rather than a
+  graph cropped to the case where it wins.
+- **The two-tier result is sensitive to a number I chose**: 1,000 local
+  entries against 10,000 keys. A different ratio moves the hit rate and the
+  conclusion with it, and I have not swept it.
 - **Analytics delivery is at-most-once.** Losses are counted, but a `SIGKILL`
   loses the buffer without counting it, so the drop tally is a floor rather
   than an exact figure.
