@@ -41,9 +41,40 @@ Duration:     30 s per step, no warm-up discarded
 Analytics:    Synchronous INSERT per redirect (phase 1 baseline)
 ```
 
-<!-- RAMP_TABLE -->
+### Concurrency ramp — finding the knee
 
-Sustained 60 s run at 100 VUs:
+| VUs | Throughput | p50 | p95 | p99 | p99.9 | Errors |
+|---:|---:|---:|---:|---:|---:|---:|
+| 25  | **14,334 req/s** | 1.58 ms | 2.64 ms | **4.04 ms** | 14.26 ms | 0.00% |
+| 50  | 12,834 req/s | 3.46 ms | 6.34 ms | 10.41 ms | 25.87 ms | 0.00% |
+| 100 | 11,033 req/s | 8.38 ms | 13.86 ms | 20.76 ms | 52.35 ms | 0.00% |
+| 200 | 7,247 req/s | 22.37 ms | 56.03 ms | 106.16 ms | 172.50 ms | 0.00% |
+| 400 | 2,843 req/s | 103.75 ms | 310.05 ms | 702.59 ms | 1133.31 ms | 0.00% |
+| 800 | 5,371 req/s | 112.37 ms | 335.37 ms | 655.21 ms | 834.00 ms | 0.00% |
+
+**The knee is at or below 25 VUs.** Throughput does not rise with concurrency
+here — it *falls*, monotonically, while p99 climbs 160x. There is no ceiling to
+find, because the system is already past saturation at the lowest step
+measured. Real capacity for this baseline is **~14.3k req/s at p99 4 ms**;
+everything to the right of that row is a system already broken, and the 800-VU
+row reading higher than the 400-VU row is run-to-run noise under contention,
+not a recovery.
+
+Two causes, and the whole point of phase 1 is that they are separable:
+
+1. **Every redirect pays for a synchronous `INSERT` plus index maintenance.**
+   The read path is bound by the write path, exactly as predicted.
+2. **Load generator and service shared 10 cores.** More concurrency meant more
+   k6 threads stealing CPU from the thing being measured.
+
+Cause 2 is a methodology flaw to fix. Cause 1 is the project. Phase 2 targets
+cause 1 and will be measured on this same machine, so the comparison holds even
+though the absolute numbers do not travel.
+
+*(Not probed below 25 VUs — the true peak may sit lower still. Worth a
+follow-up sweep at 1/2/5/10 VUs.)*
+
+### Sustained run at 100 VUs, 60 s
 
 ```
 Throughput:   12,303 req/s
@@ -57,9 +88,9 @@ throughput and latency here are pessimistic — and unusable as a headline
 number. They are still a valid *baseline*, because phase 2 will be measured on
 the same machine under the same contention.
 
-By the end of the ramp, `click_events` held **1.75 M rows in 256 MB** — every
-one of them written synchronously, on the redirect path, with an index to
-maintain. That growth is the phase 2 argument in one line.
+After the full benchmark session, `click_events` held **2.5 M rows in 364 MB** —
+every one of them written synchronously, on the redirect path, with an index to
+maintain on each insert. That table is the phase 2 argument in one line.
 
 ---
 
