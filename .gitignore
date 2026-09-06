@@ -1,6 +1,7 @@
-# Build output
-bin/
-linkflow
+# Build output. Anchored to the repository root: an unanchored "linkflow"
+# also matches the cmd/linkflow/ source directory.
+/bin/
+/linkflow
 
 # Benchmark artifacts -- results are pasted into the README with their context,
 # the raw dumps are not worth versioning.
