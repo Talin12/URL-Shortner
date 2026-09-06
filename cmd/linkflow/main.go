@@ -14,6 +14,8 @@ import (
 	"github.com/Talin12/URL-Shortner/internal/analytics"
 	"github.com/Talin12/URL-Shortner/internal/config"
 	"github.com/Talin12/URL-Shortner/internal/httpapi"
+	"github.com/Talin12/URL-Shortner/internal/metrics"
+	"github.com/Talin12/URL-Shortner/internal/resolver"
 	"github.com/Talin12/URL-Shortner/internal/store"
 )
 
@@ -51,10 +53,23 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("schema applied")
 
+	m := metrics.New()
+
 	recorder := newRecorder(cfg, db, logger)
+	m.WatchAnalytics(recorder.Stats)
 	logger.Info("analytics recorder ready", "mode", cfg.AnalyticsMode)
 
-	api := httpapi.New(db, recorder, logger, cfg.BaseURL)
+	res, err := newResolver(dialCtx, cfg, db, m, logger)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := res.Close(); err != nil {
+			logger.Error("resolver shutdown", "err", err)
+		}
+	}()
+
+	api := httpapi.New(db, res, recorder, m, logger, cfg.BaseURL)
 
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
@@ -105,6 +120,49 @@ func run(logger *slog.Logger) error {
 	)
 	logger.Info("stopped cleanly")
 	return nil
+}
+
+// newResolver builds the read path. Either cache tier can be switched off --
+// an empty LINKFLOW_REDIS_ADDR or a zero LINKFLOW_LOCAL_CACHE_ITEMS -- so the
+// benchmark can isolate no-cache, Redis-only and two-tier on one binary.
+func newResolver(ctx context.Context, cfg config.Config, db *store.Store, m *metrics.Metrics, logger *slog.Logger) (*resolver.Resolver, error) {
+	var local resolver.LocalCache
+	if cfg.LocalCacheItems > 0 {
+		r, err := resolver.NewRistretto(int64(cfg.LocalCacheItems))
+		if err != nil {
+			return nil, err
+		}
+		local = r
+	}
+
+	var shared resolver.SharedCache
+	if cfg.RedisAddr != "" {
+		r, err := resolver.NewRedis(ctx, cfg.RedisAddr, cfg.RedisPoolSize)
+		if err != nil {
+			return nil, err
+		}
+		shared = r
+	}
+
+	// Benchmark affordance only: see resolver.NewSlowStore.
+	var origin resolver.LinkStore = db
+	if cfg.OriginDelay > 0 {
+		origin = resolver.NewSlowStore(db, cfg.OriginDelay)
+		logger.Warn("origin delay injected -- benchmark mode, not for real use", "delay", cfg.OriginDelay)
+	}
+
+	logger.Info("resolver ready",
+		"local_cache_items", cfg.LocalCacheItems,
+		"redis", cfg.RedisAddr,
+		"singleflight", cfg.Singleflight,
+	)
+
+	return resolver.New(origin, local, shared, m, resolver.Config{
+		TTL:           cfg.CacheTTL,
+		NegativeTTL:   cfg.NegativeCacheTTL,
+		Singleflight:  cfg.Singleflight,
+		OriginTimeout: 3 * time.Second,
+	}), nil
 }
 
 // newRecorder picks the click-recording strategy. Both live in the binary so

@@ -38,6 +38,26 @@ type Config struct {
 	// whichever comes first.
 	AnalyticsBatchSize     int
 	AnalyticsFlushInterval time.Duration
+
+	// RedisAddr is the shared cache. Empty disables the tier entirely, which
+	// is how the benchmark isolates local-only and no-cache configurations.
+	RedisAddr string
+	// RedisPoolSize caps connections to Redis.
+	RedisPoolSize int
+	// LocalCacheItems sizes the in-process tier. Zero disables it.
+	LocalCacheItems int
+	// CacheTTL and NegativeCacheTTL control entry lifetime. Tombstones expire
+	// faster because a code that does not exist yet may exist shortly.
+	CacheTTL         time.Duration
+	NegativeCacheTTL time.Duration
+	// Singleflight collapses concurrent misses for one code into a single
+	// origin query. Switchable so the stampede fix can be measured off and on.
+	Singleflight bool
+	// OriginDelay injects artificial latency before each origin query. Zero
+	// in normal operation; used only to reproduce stampede conditions, where
+	// a sub-millisecond local Postgres warms the cache before a herd can
+	// even form.
+	OriginDelay time.Duration
 }
 
 // Analytics recorder modes.
@@ -79,7 +99,39 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	cfg.RedisAddr = env("LINKFLOW_REDIS_ADDR", "localhost:6379")
+	if cfg.RedisPoolSize, err = envInt("LINKFLOW_REDIS_POOL_SIZE", 50); err != nil {
+		return Config{}, err
+	}
+	if cfg.LocalCacheItems, err = envInt("LINKFLOW_LOCAL_CACHE_ITEMS", 100000); err != nil {
+		return Config{}, err
+	}
+	if cfg.CacheTTL, err = envDuration("LINKFLOW_CACHE_TTL", 10*time.Minute); err != nil {
+		return Config{}, err
+	}
+	if cfg.NegativeCacheTTL, err = envDuration("LINKFLOW_NEGATIVE_CACHE_TTL", 30*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.Singleflight, err = envBool("LINKFLOW_SINGLEFLIGHT", true); err != nil {
+		return Config{}, err
+	}
+	if cfg.OriginDelay, err = envDuration("LINKFLOW_ORIGIN_DELAY", 0); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+func envBool(key string, fallback bool) (bool, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("config: %s must be true or false: %w", key, err)
+	}
+	return v, nil
 }
 
 func envDuration(key string, fallback time.Duration) (time.Duration, error) {

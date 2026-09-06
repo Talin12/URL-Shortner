@@ -3,6 +3,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -12,9 +13,19 @@ import (
 	"time"
 
 	"github.com/Talin12/URL-Shortner/internal/analytics"
+	"github.com/Talin12/URL-Shortner/internal/metrics"
+	"github.com/Talin12/URL-Shortner/internal/resolver"
 	"github.com/Talin12/URL-Shortner/internal/shortcode"
 	"github.com/Talin12/URL-Shortner/internal/store"
 )
+
+// LinkResolver resolves a code to its destination. The handler does not know
+// whether that answer came from an in-process cache, Redis or Postgres --
+// which is what lets the cache tiers be added, reordered or disabled without
+// touching the hot path.
+type LinkResolver interface {
+	Destination(ctx context.Context, code string) (string, error)
+}
 
 // maxDestinationLen bounds what we accept, so one caller cannot push
 // multi-megabyte rows into the table every redirect then has to read.
@@ -23,16 +34,20 @@ const maxDestinationLen = 2048
 // API holds the handler dependencies.
 type API struct {
 	store    *store.Store
+	resolver LinkResolver
 	recorder analytics.Recorder
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 	baseURL  string
 }
 
 // New builds an API. baseURL prefixes codes in creation responses.
-func New(s *store.Store, recorder analytics.Recorder, logger *slog.Logger, baseURL string) *API {
+func New(s *store.Store, res LinkResolver, recorder analytics.Recorder, m *metrics.Metrics, logger *slog.Logger, baseURL string) *API {
 	return &API{
 		store:    s,
+		resolver: res,
 		recorder: recorder,
+		metrics:  m,
 		logger:   logger,
 		baseURL:  strings.TrimRight(baseURL, "/"),
 	}
@@ -44,6 +59,7 @@ func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /debug/analytics", a.handleAnalyticsStats)
+	mux.Handle("GET /metrics", a.metrics.Handler())
 	mux.HandleFunc("GET /readyz", a.handleReady)
 	mux.HandleFunc("POST /api/links", a.handleCreate)
 	mux.HandleFunc("GET /api/links/{code}", a.handleGetLink)
@@ -99,22 +115,29 @@ func (a *API) handleCreate(w http.ResponseWriter, r *http.Request) {
 // response header is on the latency budget; the click event deliberately is
 // not, once phase 2 lands.
 func (a *API) handleRedirect(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() { a.metrics.RedirectDuration.Observe(time.Since(start).Seconds()) }()
+
 	code := r.PathValue("code")
 	if !shortcode.Valid(code) {
+		a.metrics.Redirects.WithLabelValues("invalid").Inc()
 		writeError(w, http.StatusNotFound, "unknown code")
 		return
 	}
 
-	destination, err := a.store.Destination(r.Context(), code)
+	destination, err := a.resolver.Destination(r.Context(), code)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, resolver.ErrNotFound) || errors.Is(err, store.ErrNotFound) {
+			a.metrics.Redirects.WithLabelValues("not_found").Inc()
 			writeError(w, http.StatusNotFound, "unknown code")
 			return
 		}
+		a.metrics.Redirects.WithLabelValues("error").Inc()
 		a.logger.Error("resolve code", "code", code, "err", err)
 		writeError(w, http.StatusInternalServerError, "could not resolve link")
 		return
 	}
+	a.metrics.Redirects.WithLabelValues("found").Inc()
 
 	// Without this, an intermediary caches the 302 and later clicks never
 	// reach the service, silently losing analytics.

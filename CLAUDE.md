@@ -23,7 +23,7 @@ Two consequences that matter for almost every change:
 
 ## Build phase status
 
-`PLAN.md` §6 defines six phases. Current state: **phases 1-2 complete.**
+`PLAN.md` §6 defines six phases. Current state: **phases 1-3 complete.**
 
 Phase 1's synchronous recorder is still in the binary, selected by
 `LINKFLOW_ANALYTICS_MODE=sync`. It is not dead code — it is the control arm.
@@ -37,10 +37,20 @@ later phases have a before-number to beat:
 
 | Still naive | Replaced by |
 |---|---|
-| No caching; every redirect hits Postgres | Phase 3: Ristretto → Redis → Postgres, with singleflight |
-| Counters exposed as JSON on `/debug/analytics` | Phase 3: Prometheus + Grafana |
 | Click events in Postgres | Phase 4: ClickHouse, after documenting how Postgres fails |
 | `nextval()` per creation, sequential/enumerable codes | Phase 5: block allocator + Feistel bijection (§5.4) |
+| Single instance | Phase 5: 3 replicas behind nginx |
+
+Every switchable behaviour exists so a design claim can be *measured* rather
+than asserted. Do not remove one because it looks like dead code:
+
+| Switch | Off value | What it measures |
+|---|---|---|
+| `LINKFLOW_ANALYTICS_MODE` | `sync` | Phase 1 baseline vs the decoupled write path |
+| `LINKFLOW_LOCAL_CACHE_ITEMS` | `0` | What the in-process tier is worth |
+| `LINKFLOW_REDIS_ADDR` | `""` | What the shared tier is worth |
+| `LINKFLOW_SINGLEFLIGHT` | `false` | The stampede control arm |
+| `LINKFLOW_ORIGIN_DELAY` | `0` | Benchmark-only: makes a stampede reproducible |
 
 ## Commands
 
@@ -49,6 +59,9 @@ make help              # list targets
 make up                # docker compose: Postgres + service, waits for health
 make up ANALYTICS_MODE=sync   # same binary, phase 1 baseline recorder
 make stats             # analytics counters, including drops
+make cache-stats       # per-tier cache counters from /metrics
+make stampede          # 10k concurrent requests at a cold key, counts PG queries
+make grafana           # open the provisioned dashboard
 make down              # stop, keep the Postgres volume
 make clean             # stop, drop the volume, remove bench artifacts
 
@@ -84,12 +97,16 @@ make bench-ramp        # sweep 25→800 VUs to find the knee
 ```
 cmd/linkflow/          entrypoint: config → store → recorder → API → graceful shutdown
 internal/config/       env-var config, defaults matching docker-compose
+internal/metrics/      Prometheus collectors on a private registry
+internal/resolver/     two-tier cache + singleflight + origin fallback
 internal/store/        all Postgres access; owns the embedded schema
 internal/shortcode/    base62 encode/decode
 internal/analytics/    Recorder interface + phase 1 synchronous implementation
 internal/httpapi/      routes, validation, the redirect hot path
 bench/seed/            Go tool that populates links and writes codes.json
+bench/stampede/        fires N concurrent requests at a cold key, counts PG queries
 bench/redirect.js      k6 script, Zipfian key sampling
+deploy/                Prometheus scrape config, provisioned Grafana dashboard
 ```
 
 The pieces that are load-bearing across files:
@@ -109,6 +126,24 @@ flushes are never concurrent. Flushes use `context.Background()`, not the
 request context — the request is long gone by then, and inheriting it would
 cancel writes for no reason. Every drop category is a separate counter because
 a drop policy is only defensible while the drops are visible.
+
+**The resolver is the read path, and the handler cannot see inside it.**
+`httpapi.LinkResolver` is one method. The handler does not know whether an
+answer came from Ristretto, Redis or Postgres, which is what lets a tier be
+disabled or reordered without touching the hot path. Tier order is local →
+shared → origin, populating on the way back.
+
+Three details in `resolver` that are load-bearing:
+
+- **Negative caching.** A missing code is cached as a tombstone with a shorter
+  TTL. Without it, a scanner walking the keyspace misses every tier and lands
+  on Postgres every time.
+- **`context.WithoutCancel` around the origin query.** Under singleflight one
+  caller owns the query; if that caller's request were cancelled, everyone
+  waiting behind it would fail with a cancellation that has nothing to do with
+  them.
+- **Redis errors are counted and stepped past**, never returned. A Redis
+  outage must cost latency, not availability.
 
 **`store` owns the schema, and it is embedded.** `internal/store/schema/*.sql`
 is compiled into the binary and applied by `Migrate` on every boot. All

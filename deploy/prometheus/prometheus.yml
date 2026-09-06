@@ -1,0 +1,10 @@
+# 2s scrape interval: benchmark runs are 30s, and a 15s default would give
+# only two points per run.
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: linkflow
+    static_configs:
+      - targets: ["linkflow:8080"]

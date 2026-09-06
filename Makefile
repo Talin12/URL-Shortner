@@ -6,6 +6,7 @@ VUS ?= 100
 DURATION ?= 60s
 ZIPF_S ?= 1.2
 ANALYTICS_MODE ?= batch
+STAMPEDE_N ?= 10000
 TEST_DATABASE_URL ?= postgres://linkflow:linkflow@localhost:5433/linkflow_test?sslmode=disable
 
 .PHONY: help
@@ -72,6 +73,19 @@ bench: ## Run the k6 redirect benchmark against the seeded key set
 .PHONY: stats
 stats: ## Show the analytics recorder counters, including drops
 	@curl -sS $(BASE_URL)/debug/analytics | python3 -m json.tool
+
+.PHONY: cache-stats
+cache-stats: ## Show per-tier cache counters from /metrics
+	@curl -sS $(BASE_URL)/metrics | grep -E "^linkflow_(cache_lookups|origin_queries|singleflight|shared_cache)" | grep -v "^#"
+
+.PHONY: stampede
+stampede: ## Fire STAMPEDE_N concurrent requests at a cold key and count PG queries
+	go run ./bench/stampede -base-url $(BASE_URL) -concurrent $(STAMPEDE_N)
+
+.PHONY: grafana
+grafana: ## Open the Grafana dashboard
+	@echo "http://localhost:$${LINKFLOW_GRAFANA_PORT:-3000}/d/linkflow-overview"
+	@open "http://localhost:$${LINKFLOW_GRAFANA_PORT:-3000}/d/linkflow-overview" 2>/dev/null || true
 
 .PHONY: bench-ramp
 bench-ramp: ## Ramp concurrency to find the knee (throughput vs p99)
