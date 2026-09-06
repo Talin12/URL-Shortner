@@ -51,7 +51,9 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("schema applied")
 
-	recorder := analytics.NewSync(db, logger)
+	recorder := newRecorder(cfg, db, logger)
+	logger.Info("analytics recorder ready", "mode", cfg.AnalyticsMode)
+
 	api := httpapi.New(db, recorder, logger, cfg.BaseURL)
 
 	srv := &http.Server{
@@ -90,6 +92,32 @@ func run(logger *slog.Logger) error {
 	if err := recorder.Close(shutdownCtx); err != nil {
 		logger.Error("recorder shutdown", "err", err)
 	}
+
+	// Say what was lost. A drop policy is only defensible if the drops are
+	// visible (PLAN.md section 5.1).
+	stats := recorder.Stats()
+	logger.Info("analytics summary",
+		"mode", stats.Mode,
+		"accepted", stats.Accepted,
+		"written", stats.Written,
+		"dropped", stats.Dropped(),
+		"batches", stats.Batches,
+	)
 	logger.Info("stopped cleanly")
 	return nil
+}
+
+// newRecorder picks the click-recording strategy. Both live in the binary so
+// the phase 1 baseline and the phase 2 decoupled path can be compared on the
+// same hardware without rebuilding.
+func newRecorder(cfg config.Config, db *store.Store, logger *slog.Logger) analytics.Recorder {
+	if cfg.AnalyticsMode == config.ModeSync {
+		return analytics.NewSync(db, logger)
+	}
+	return analytics.NewBatch(db, logger, analytics.BatchConfig{
+		BufferSize:    cfg.AnalyticsBuffer,
+		BatchSize:     cfg.AnalyticsBatchSize,
+		FlushInterval: cfg.AnalyticsFlushInterval,
+		FlushTimeout:  5 * time.Second,
+	})
 }

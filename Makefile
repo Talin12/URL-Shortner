@@ -5,6 +5,7 @@ SEED_COUNT ?= 10000
 VUS ?= 100
 DURATION ?= 60s
 ZIPF_S ?= 1.2
+ANALYTICS_MODE ?= batch
 TEST_DATABASE_URL ?= postgres://linkflow:linkflow@localhost:5433/linkflow_test?sslmode=disable
 
 .PHONY: help
@@ -44,8 +45,8 @@ fmt: ## Format all Go source
 check: fmt vet test ## Format, vet and test
 
 .PHONY: up
-up: ## Start Postgres and the service via Docker Compose
-	docker compose up --build -d
+up: ## Start the stack (ANALYTICS_MODE=batch|sync)
+	LINKFLOW_ANALYTICS_MODE=$(ANALYTICS_MODE) docker compose up --build -d
 
 .PHONY: down
 down: ## Stop the stack, keeping the Postgres volume
@@ -67,6 +68,10 @@ seed: ## Create SEED_COUNT links and write bench/codes.json
 .PHONY: bench
 bench: ## Run the k6 redirect benchmark against the seeded key set
 	cd bench && k6 run -e BASE_URL=$(BASE_URL) -e VUS=$(VUS) -e DURATION=$(DURATION) -e ZIPF_S=$(ZIPF_S) redirect.js
+
+.PHONY: stats
+stats: ## Show the analytics recorder counters, including drops
+	@curl -sS $(BASE_URL)/debug/analytics | python3 -m json.tool
 
 .PHONY: bench-ramp
 bench-ramp: ## Ramp concurrency to find the knee (throughput vs p99)

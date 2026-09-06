@@ -43,6 +43,7 @@ func New(s *store.Store, recorder analytics.Recorder, logger *slog.Logger, baseU
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealth)
+	mux.HandleFunc("GET /debug/analytics", a.handleAnalyticsStats)
 	mux.HandleFunc("GET /readyz", a.handleReady)
 	mux.HandleFunc("POST /api/links", a.handleCreate)
 	mux.HandleFunc("GET /api/links/{code}", a.handleGetLink)
@@ -163,6 +164,17 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, statsResponse{Code: code, Clicks: clicks})
+}
+
+// handleAnalyticsStats exposes the recorder counters, most importantly the
+// drop tallies. Dropping events under backpressure is only a defensible
+// decision while the drops are observable; Prometheus replaces this in phase 3.
+func (a *API) handleAnalyticsStats(w http.ResponseWriter, _ *http.Request) {
+	stats := a.recorder.Stats()
+	writeJSON(w, http.StatusOK, struct {
+		analytics.Stats
+		DroppedTotal uint64 `json:"dropped_total"`
+	}{Stats: stats, DroppedTotal: stats.Dropped()})
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, _ *http.Request) {

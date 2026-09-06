@@ -35,6 +35,12 @@ services:
       LINKFLOW_DATABASE_URL: "postgres://linkflow:linkflow@postgres:5432/linkflow?sslmode=disable"
       LINKFLOW_BASE_URL: "http://localhost:8080"
       LINKFLOW_MAX_POOL_CONNS: "25"
+      # "batch" is phase 2 (decoupled write path); "sync" restores the phase 1
+      # baseline so the two can be compared on identical hardware.
+      LINKFLOW_ANALYTICS_MODE: "${LINKFLOW_ANALYTICS_MODE:-batch}"
+      LINKFLOW_ANALYTICS_BUFFER: "${LINKFLOW_ANALYTICS_BUFFER:-10000}"
+      LINKFLOW_ANALYTICS_BATCH_SIZE: "${LINKFLOW_ANALYTICS_BATCH_SIZE:-1000}"
+      LINKFLOW_ANALYTICS_FLUSH_INTERVAL: "${LINKFLOW_ANALYTICS_FLUSH_INTERVAL:-200ms}"
     ports:
       - "${LINKFLOW_PORT:-8080}:8080"
     depends_on:

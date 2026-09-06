@@ -23,23 +23,32 @@ Two consequences that matter for almost every change:
 
 ## Build phase status
 
-`PLAN.md` §6 defines six phases. Current state: **phase 1 (baseline) complete.**
+`PLAN.md` §6 defines six phases. Current state: **phases 1-2 complete.**
 
-Phase 1 is *deliberately naive* in three places. If you find yourself about to
-"improve" one of these without being asked, check the phase plan first — the
-naive version exists so later phases have a before-number to beat:
+Phase 1's synchronous recorder is still in the binary, selected by
+`LINKFLOW_ANALYTICS_MODE=sync`. It is not dead code — it is the control arm.
+Keeping both strategies in one binary is what lets the phase 1 baseline and the
+phase 2 decoupled path be measured on identical hardware in the same session.
+**Do not delete it.**
 
-| Deliberately naive in phase 1 | Replaced by |
+Still *deliberately naive*, by plan. If you are about to "improve" one of these
+without being asked, check the phase plan first — the naive version exists so
+later phases have a before-number to beat:
+
+| Still naive | Replaced by |
 |---|---|
-| Synchronous click insert on the redirect path | Phase 2: bounded channel + batcher goroutine |
 | No caching; every redirect hits Postgres | Phase 3: Ristretto → Redis → Postgres, with singleflight |
-| `nextval()` per creation, sequential/enumerable codes | Later: block allocator + Feistel bijection (§5.4) |
+| Counters exposed as JSON on `/debug/analytics` | Phase 3: Prometheus + Grafana |
+| Click events in Postgres | Phase 4: ClickHouse, after documenting how Postgres fails |
+| `nextval()` per creation, sequential/enumerable codes | Phase 5: block allocator + Feistel bijection (§5.4) |
 
 ## Commands
 
 ```bash
 make help              # list targets
 make up                # docker compose: Postgres + service, waits for health
+make up ANALYTICS_MODE=sync   # same binary, phase 1 baseline recorder
+make stats             # analytics counters, including drops
 make down              # stop, keep the Postgres volume
 make clean             # stop, drop the volume, remove bench artifacts
 
@@ -89,8 +98,17 @@ The pieces that are load-bearing across files:
 `Record(ctx, ev)` and never learns whether that is a synchronous insert or a
 non-blocking channel send. `Record` returns nothing on purpose — there is no
 error for the redirect path to handle, because analytics failing is not a
-redirect failure. Phase 2 is a new `Recorder` implementation plus a wiring
-change in `main.go`, not a rewrite of the handler.
+redirect failure. Adding phase 2 meant a new implementation plus a wiring
+change in `newRecorder`, with the handler untouched; phase 4's ClickHouse
+writer lands the same way.
+
+**`BatchRecorder` owns the backpressure decision.** `Record` is a non-blocking
+send onto a bounded channel; when it is full the event is dropped and counted.
+A single goroutine owns the buffer, so the batch slice needs no locking and
+flushes are never concurrent. Flushes use `context.Background()`, not the
+request context — the request is long gone by then, and inheriting it would
+cancel writes for no reason. Every drop category is a separate counter because
+a drop policy is only defensible while the drops are visible.
 
 **`store` owns the schema, and it is embedded.** `internal/store/schema/*.sql`
 is compiled into the binary and applied by `Migrate` on every boot. All
