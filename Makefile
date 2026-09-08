@@ -25,6 +25,19 @@ build: ## Compile the service binary to bin/linkflow
 run: ## Run the service against a local Postgres
 	go run ./cmd/linkflow
 
+# The smallest thing that still serves a real redirect: one container instead
+# of the nine `make up` starts. ClickHouse, Prometheus, Grafana and nginx are
+# not needed to exercise the read or write path, and Redis is switched off
+# rather than started -- an empty LINKFLOW_REDIS_ADDR is what disables the
+# shared tier, so the local cache serves the hot keys on its own. Use `make up`
+# when you need the full stack; use this when you just want to see it work.
+.PHONY: dev
+dev: ## Run the light stack: Postgres in Docker, service on the host
+	docker compose up -d postgres
+	@until [ "$$(docker inspect --format '{{.State.Health.Status}}' $$(docker compose ps -q postgres) 2>/dev/null)" = "healthy" ]; do sleep 1; done
+	@echo "postgres healthy -- service on $(BASE_URL); ctrl-c to stop, then 'make down'"
+	LINKFLOW_REDIS_ADDR="" go run ./cmd/linkflow
+
 .PHONY: test
 test: ## Run unit tests (no external dependencies required)
 	go test ./...
